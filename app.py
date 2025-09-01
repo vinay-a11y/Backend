@@ -548,7 +548,7 @@ def _place_order_txn(
     shipping_address: str,
     phone: str,
     payment_method: str
-) -> Tuple[int, str]:
+) -> Tuple[int, str, Dict[str, Any], List[Dict[str, Any]]]:
     product_refs = [db.collection("products").document(str(it["id"])) for it in cart_items]
 
     # Read product snapshots inside the transaction (READS)
@@ -575,6 +575,8 @@ def _place_order_txn(
         price = float(pdata.get("price", 0.0))
         normalized_items.append({
             "id": int(it["id"]),
+            "name": pdata.get("name", f"Product {it['id']}"),
+            "image": pdata.get("image"),
             "quantity": qty,
             "price": price,
             "size": it.get("size", "Free Size"),
@@ -586,6 +588,7 @@ def _place_order_txn(
     # Compute derived values (no Firestore reads)
     total_amount = sum(float(n["price"]) * int(n["quantity"]) for n in normalized_items)
     tracking_number = f"SRC{int(time.time())}{int(current_user_id):04d}"
+    now_ts = _now_ts()
     order_payload = {
         "id": order_id,
         "user_id": int(current_user_id),
@@ -596,8 +599,8 @@ def _place_order_txn(
         "customer_phone": phone,
         "payment_method": payment_method,
         "tracking_number": tracking_number,
-        "created_at": _now_ts(),
-        "updated_at": _now_ts(),
+        "created_at": now_ts,
+        "updated_at": now_ts,
     }
 
     # Perform all writes after reads (WRITES)
@@ -628,7 +631,21 @@ def _place_order_txn(
         new_stock = int(n["current_stock"]) - int(n["quantity"])
         transaction.update(n["ref"], {"stock": new_stock})
 
-    return order_id, tracking_number
+    # Build a response-friendly items array (no references)
+    items_for_response: List[Dict[str, Any]] = []
+    for n in normalized_items:
+        items_for_response.append({
+            "product_id": int(n["id"]),
+            "name": n.get("name"),
+            "image": n.get("image"),
+            "price": float(n["price"]),
+            "quantity": int(n["quantity"]),
+            "size": n.get("size", "Free Size"),
+            "color": n.get("color", ""),
+            "subtotal": float(n["price"]) * int(n["quantity"]),
+        })
+
+    return order_id, tracking_number, order_payload, items_for_response
 
 @app.post("/api/orders")
 async def place_order(order_data: OrderCreate, current_user: dict = Depends(get_current_user)):
@@ -656,7 +673,7 @@ async def place_order(order_data: OrderCreate, current_user: dict = Depends(get_
         raise HTTPException(status_code=400, detail="Invalid cart item payload")
 
     try:
-        order_id, tracking = _place_order_txn(
+        order_id, tracking, order_doc, items_detail = _place_order_txn(
             db.transaction(),
             int(current_user["id"]),
             cart_items,
@@ -679,7 +696,32 @@ async def place_order(order_data: OrderCreate, current_user: dict = Depends(get_
 
     clear_cache_pattern("orders")
     clear_cache_pattern("products")
-    return {"success": True, "order_id": order_id, "tracking_number": tracking}
+
+    # Build client/device-friendly response including full order + items
+    created_at_iso = _ts_to_iso(order_doc.get("created_at"))
+    updated_at_iso = _ts_to_iso(order_doc.get("updated_at"))
+
+    return {
+        "success": True,
+        "order_id": order_id,
+        "tracking_number": tracking,
+        "order": {
+            "id": order_id,
+            "user_id": int(current_user["id"]),
+            "status": order_doc.get("status", "pending"),
+            "total_amount": float(order_doc.get("total_amount", 0.0)),
+            "shipping_address": order_doc.get("shipping_address", ""),
+            "phone": order_doc.get("phone") or order_doc.get("customer_phone", ""),
+            "payment_method": order_doc.get("payment_method", "cod"),
+            "tracking_number": tracking,
+            "created_at": order_doc.get("created_at"),
+            "updated_at": order_doc.get("updated_at"),
+            "created_at_iso": created_at_iso,
+            "updated_at_iso": updated_at_iso,
+            "items": items_detail,
+            "item_count": len(items_detail),
+        },
+    }
 
 # -------------------------------
 # Reviews
@@ -800,24 +842,50 @@ async def get_admin_orders(current_user: dict = Depends(get_admin_user)):
     orders = await get_collection_cached("orders")
     users = await get_collection_cached("users")
     user_name = {u["id"]: u.get("name") for u in users}
+    user_email = {u["id"]: u.get("email") for u in users}
+    user_phone = {u["id"]: u.get("phone") for u in users}
+
+    products = await get_collection_cached("products")
+    product_map = {int(p["id"]): p for p in products if p.get("id")}
+
+    all_items = await get_collection_cached("order_items")
+
     result = []
     for o in orders:
-        items = await get_collection_cached("order_items")
-        items = [i for i in items if int(i.get("order_id", 0)) == int(o["id"])]
+        items = [i for i in all_items if int(i.get("order_id", 0)) == int(o["id"])]
+        # normalize/enrich items
+        norm_items = []
+        for i in items:
+            pid = int(i.get("product_id") or i.get("id") or 0)
+            p = product_map.get(pid) or {}
+            qty = int(i.get("quantity") or 0)
+            price = float(i.get("price") or p.get("price") or 0.0)
+            norm_items.append({
+                "product_id": pid,
+                "name": i.get("name") or p.get("name"),
+                "image": i.get("image") or (p.get("images", [p.get("image")])[0] if p else None),
+                "quantity": qty,
+                "price": price,
+                "size": i.get("size") or "Free Size",
+                "color": i.get("color") or (p.get("color") or ""),
+                "subtotal": price * qty,
+            })
+
         result.append({
             "id": o["id"],
             "user_id": o.get("user_id"),
             "customer_name": user_name.get(int(o.get("user_id", 0))),
-            "total_amount": o.get("total_amount", 0.0),
+            "customer_email": user_email.get(int(o.get("user_id", 0))),
+            "customer_phone": o.get("phone") or o.get("customer_phone") or user_phone.get(int(o.get("user_id", 0))),
+            "total_amount": o.get("total_amount", sum((it["subtotal"] for it in norm_items), 0.0)),
             "status": o.get("status", "pending"),
             "shipping_address": o.get("shipping_address", ""),
-            "phone": o.get("phone") or o.get("customer_phone", ""),
             "payment_method": o.get("payment_method", "cod"),
             "tracking_number": o.get("tracking_number", ""),
             "created_at": _ts_to_iso(o.get("created_at")),
             "updated_at": _ts_to_iso(o.get("updated_at")),
-            "items": items,
-            "item_count": len(items),
+            "items": norm_items,
+            "item_count": len(norm_items),
         })
     result.sort(key=lambda x: _ts_to_epoch(x.get("created_at", 0)), reverse=True)
     return result
@@ -938,48 +1006,47 @@ async def get_user_orders(current_user: dict = Depends(get_current_user)):
     my_orders = [o for o in orders if int(o.get("user_id", 0)) == uid]
 
     products = await get_collection_cached("products")
-    product_name_map = {int(p.get("id")): (p.get("name") or f"Product {p.get('id')}") for p in products if p.get("id")}
+    product_map = {int(p.get("id")): p for p in products if p.get("id")}
 
-    # Collect items for each order
     all_items = await get_collection_cached("order_items")
+
     result: List[Dict[str, Any]] = []
     for o in my_orders:
-        items = [i for i in all_items if int(i.get("order_id", 0)) == int(o["id"])]
-        items_text_parts: List[str] = []
-        for it in items:
-            pid = int(it.get("product_id", 0))
-            qty = int(it.get("quantity", 0))
-            size = it.get("size") or "Free Size"
-            color = it.get("color") or ""
-            name = product_name_map.get(pid, f"#{pid}")
-            suffix = f" • {color}" if color else ""
-            items_text_parts.append(f"{name} x{qty} ({size}){suffix}")
-        items_text = ", ".join(items_text_parts) if items_text_parts else "Items information not available"
-
-        created_at_raw = o.get("created_at")
-        updated_at_raw = o.get("updated_at")
-
-        created_at_iso = _ts_to_iso(created_at_raw)
-        updated_at_iso = _ts_to_iso(updated_at_raw)
+        # items for this order
+        raw_items = [i for i in all_items if int(i.get("order_id", 0)) == int(o["id"])]
+        items_enriched: List[Dict[str, Any]] = []
+        total = 0.0
+        for i in raw_items:
+            pid = int(i.get("product_id") or i.get("id") or 0)
+            p = product_map.get(pid) or {}
+            qty = int(i.get("quantity") or 0)
+            price = float(i.get("price") or p.get("price") or 0.0)
+            subtotal = price * qty
+            total += subtotal
+            items_enriched.append({
+                "product_id": pid,
+                "name": i.get("name") or p.get("name") or f"Product {pid}",
+                "image": i.get("image") or (p.get("images", [p.get("image")])[0] if p else None),
+                "quantity": qty,
+                "price": price,
+                "size": i.get("size") or "Free Size",
+                "color": i.get("color") or (p.get("color") or ""),
+                "subtotal": subtotal,
+            })
 
         result.append({
             "id": o["id"],
-            "user_id": uid,
-            "total_amount": o.get("total_amount", 0.0),
+            "user_id": o.get("user_id"),
+            "total_amount": o.get("total_amount", total),
             "status": o.get("status", "pending"),
             "shipping_address": o.get("shipping_address", ""),
             "phone": o.get("phone") or o.get("customer_phone", ""),
             "payment_method": o.get("payment_method", "cod"),
             "tracking_number": o.get("tracking_number", ""),
-            "created_at": created_at_iso,
-            "updated_at": updated_at_iso,
-            "created_at_epoch": _ts_to_epoch(created_at_raw),
-            "updated_at_epoch": _ts_to_epoch(updated_at_raw),
-            "created_at_iso": created_at_iso,
-            "updated_at_iso": updated_at_iso,
-            "items": items_text,
-            "items_raw": items,
-            "item_count": len(items),
+            "created_at": _ts_to_iso(o.get("created_at")),
+            "updated_at": _ts_to_iso(o.get("updated_at")),
+            "items": items_enriched,
+            "item_count": len(items_enriched),
         })
 
     result.sort(key=lambda x: float(x.get("created_at_epoch", 0)), reverse=True)
@@ -991,4 +1058,4 @@ async def get_user_orders(current_user: dict = Depends(get_current_user)):
 if __name__ == "__main__":
     import uvicorn
     port = int(os.getenv("PORT", "8000"))
-    uvicorn.run("backend.app:app", host="0.0.0.0", port=port, reload=True)
+    uvicorn.run("app:app", host="0.0.0.0", port=port, reload=True)
