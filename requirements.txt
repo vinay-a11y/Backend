@@ -1,0 +1,6 @@
+fastapi
+uvicorn[standard]
+pydantic[email]
+firebase-admin
+requests
+python-jose[cryptography]
