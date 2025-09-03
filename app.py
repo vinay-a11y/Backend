@@ -696,6 +696,7 @@ async def place_order(order_data: OrderCreate, current_user: dict = Depends(get_
 
     clear_cache_pattern("orders")
     clear_cache_pattern("products")
+    clear_cache_pattern("order_items")  # ensure immediate visibility of line items
 
     # Build client/device-friendly response including full order + items
     created_at_iso = _ts_to_iso(order_doc.get("created_at"))
