@@ -887,7 +887,7 @@ async def get_admin_orders(current_user: dict = Depends(get_admin_user)):
             "items": norm_items,
             "item_count": len(norm_items),
         })
-    result.sort(key=lambda x: _ts_to_epoch(x.get("created_at", 0)), reverse=True)
+    result.sort(key=lambda x: int(x.get("id", 0)), reverse=True)
     return result
 
 @app.put("/api/admin/orders/{order_id}/status")
@@ -1049,7 +1049,8 @@ async def get_user_orders(current_user: dict = Depends(get_current_user)):
             "item_count": len(items_enriched),
         })
 
-    result.sort(key=lambda x: float(x.get("created_at_epoch", 0)), reverse=True)
+    result.sort(key=lambda x: int(x.get("id", 0)), reverse=True)
+    result = result[:15]
     return result
 
 # -------------------------------
