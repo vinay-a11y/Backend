@@ -560,6 +560,12 @@ def _place_order_txn(
     curr_val = int(counters_snap.to_dict().get("value", 0)) if counters_snap.exists else 0
     order_id = curr_val + 1
 
+    user_counter_key = f"orders_user_{int(current_user_id)}"
+    user_counters_ref = db.collection("counters").document(user_counter_key)
+    user_counters_snap = user_counters_ref.get(transaction=transaction)
+    curr_user_val = int(user_counters_snap.to_dict().get("value", 0)) if user_counters_snap.exists else 0
+    order_number = curr_user_val + 1
+
     # Build normalized list using authoritative values (still just using data from reads)
     normalized_items: List[Dict[str, Any]] = []
     for it, snap in zip(cart_items, product_snaps):
@@ -601,11 +607,13 @@ def _place_order_txn(
         "tracking_number": tracking_number,
         "created_at": now_ts,
         "updated_at": now_ts,
+        "order_number": int(order_number),
     }
 
     # Perform all writes after reads (WRITES)
     # 1) Persist the incremented counter
     transaction.set(counters_ref, {"value": order_id})
+    transaction.set(user_counters_ref, {"value": order_number})
 
     # 2) Create order
     order_ref = db.collection("orders").document(str(order_id))
@@ -706,6 +714,7 @@ async def place_order(order_data: OrderCreate, current_user: dict = Depends(get_
         "success": True,
         "order_id": order_id,
         "tracking_number": tracking,
+        "order_number": int(order_doc.get("order_number", 0)),
         "order": {
             "id": order_id,
             "user_id": int(current_user["id"]),
@@ -721,6 +730,7 @@ async def place_order(order_data: OrderCreate, current_user: dict = Depends(get_
             "updated_at_iso": updated_at_iso,
             "items": items_detail,
             "item_count": len(items_detail),
+            "order_number": int(order_doc.get("order_number", 0)),
         },
     }
 
